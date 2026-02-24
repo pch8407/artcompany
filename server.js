@@ -1,114 +1,105 @@
 import express from "express";
-import Database from "better-sqlite3";
-import path from "path";
-import { fileURLToPath } from "url";
+import pkg from "pg";
+const { Pool } = pkg;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const app = express();
+app.use(express.json());
 
-const db = new Database("attendance.db");
+const PORT = process.env.PORT || 3000;
 
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS employees (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE
-  );
+// Postgres 연결
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-  CREATE TABLE IF NOT EXISTS attendance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_id INTEGER NOT NULL,
-    date TEXT NOT NULL,
-    value REAL NOT NULL,
-    UNIQUE(employee_id, date),
-    FOREIGN KEY (employee_id) REFERENCES employees(id)
-  );
+// 테이블 생성
+await pool.query(`
+CREATE TABLE IF NOT EXISTS employees (
+  id SERIAL PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attendance (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER REFERENCES employees(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,
+  value REAL NOT NULL,
+  UNIQUE(employee_id, date)
+);
 `);
 
-// Insert initial employees if they don't exist
+// 초기 직원 추가
 const initialEmployees = ["창현", "용기", "상화"];
-const insertEmployee = db.prepare("INSERT OR IGNORE INTO employees (name) VALUES (?)");
-initialEmployees.forEach(name => insertEmployee.run(name));
-
-async function startServer() {
-  const app = express();
-  const PORT = process.env.PORT || 3000;
-
-  app.use(express.json());
-
-  // Serve static files
-  app.use(express.static(path.join(__dirname, ".")));
-  app.use("/src", express.static(path.join(__dirname, "src")));
-
-  // API Routes
-  app.get("/api/employees", (req, res) => {
-    const employees = db.prepare("SELECT * FROM employees").all();
-    res.json(employees);
-  });
-
-  app.post("/api/employees", (req, res) => {
-    const { name } = req.body;
-    try {
-      const info = db.prepare("INSERT INTO employees (name) VALUES (?)").run(name);
-      res.json({ id: info.lastInsertRowid, name });
-    } catch (err) {
-      res.status(400).json({ error: "이미 존재하는 이름이거나 잘못된 요청입니다." });
-    }
-  });
-
-  app.delete("/api/employees/:id", (req, res) => {
-    const { id } = req.params;
-    try {
-      // First delete attendance records for this employee
-      db.prepare("DELETE FROM attendance WHERE employee_id = ?").run(id);
-      // Then delete the employee
-      const info = db.prepare("DELETE FROM employees WHERE id = ?").run(id);
-      if (info.changes > 0) {
-        res.json({ success: true });
-      } else {
-        res.status(404).json({ error: "직원을 찾을 수 없습니다." });
-      }
-    } catch (err) {
-      res.status(500).json({ error: "삭제 중 오류가 발생했습니다." });
-    }
-  });
-
-  app.get("/api/attendance", (req, res) => {
-    const { date, month } = req.query;
-    if (date) {
-      const records = db.prepare("SELECT * FROM attendance WHERE date = ?").all(date);
-      res.json(records);
-    } else if (month) {
-      // month format: YYYY-MM
-      const records = db.prepare(`
-        SELECT a.*, e.name as employee_name 
-        FROM attendance a 
-        JOIN employees e ON a.employee_id = e.id 
-        WHERE a.date LIKE ?
-      `).all(`${month}%`);
-      res.json(records);
-    } else {
-      res.status(400).json({ error: "date or month parameter is required" });
-    }
-  });
-
-  app.post("/api/attendance", (req, res) => {
-    const { employee_id, date, value } = req.body;
-    try {
-      db.prepare(`
-        INSERT INTO attendance (employee_id, date, value) 
-        VALUES (?, ?, ?)
-        ON CONFLICT(employee_id, date) DO UPDATE SET value = excluded.value
-      `).run(employee_id, date, value);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(500).json({ error: "기록 저장 중 오류가 발생했습니다." });
-    }
-  });
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+for (const name of initialEmployees) {
+  await pool.query(
+    `INSERT INTO employees (name) VALUES ($1) ON CONFLICT DO NOTHING`,
+    [name]
+  );
 }
 
-startServer();
+// API
+
+app.get("/api/employees", async (req, res) => {
+  const result = await pool.query("SELECT * FROM employees ORDER BY id");
+  res.json(result.rows);
+});
+
+app.post("/api/employees", async (req, res) => {
+  const { name } = req.body;
+  try {
+    const result = await pool.query(
+      "INSERT INTO employees (name) VALUES ($1) RETURNING *",
+      [name]
+    );
+    res.json(result.rows[0]);
+  } catch {
+    res.status(400).json({ error: "이미 존재하는 이름입니다." });
+  }
+});
+
+app.delete("/api/employees/:id", async (req, res) => {
+  await pool.query("DELETE FROM employees WHERE id = $1", [req.params.id]);
+  res.json({ success: true });
+});
+
+app.get("/api/attendance", async (req, res) => {
+  const { date, month } = req.query;
+
+  if (date) {
+    const result = await pool.query(
+      "SELECT * FROM attendance WHERE date = $1",
+      [date]
+    );
+    res.json(result.rows);
+  } else if (month) {
+    const result = await pool.query(`
+      SELECT a.*, e.name as employee_name
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      WHERE a.date LIKE '${month}%'
+    `);
+    res.json(result.rows);
+  } else {
+    res.status(400).json({ error: "date or month required" });
+  }
+});
+
+app.post("/api/attendance", async (req, res) => {
+  const { employee_id, date, value } = req.body;
+
+  await pool.query(`
+    INSERT INTO attendance (employee_id, date, value)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (employee_id, date)
+    DO UPDATE SET value = EXCLUDED.value
+  `, [employee_id, date, value]);
+
+  res.json({ success: true });
+});
+
+app.use(express.static("."));
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
