@@ -1,4 +1,11 @@
 {
+  "name": "artcompany",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "better-sqlite3": "^12.6.2",
     "express": "^5.2.1"
